@@ -1,0 +1,148 @@
+{
+  "name": "Login Anomaly — Ingest → Feature → Score → Alert",
+  "nodes": [
+    {
+      "id": "ManualTrigger",
+      "name": "When clicking 'Execute workflow'",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [ 200, 300 ],
+      "parameters": {}
+    },
+    {
+      "id": "BuildSample",
+      "name": "Build Sample Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [ 460, 300 ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Build a single sample login event for testing\nconst now = new Date();\nreturn [{\n  json: {\n    user_id: \"u_001\",\n    ts: now.toISOString(),\n    ip: \"81.2.69.160\",\n    country: \"GB\",\n    region: \"England\",\n    city: \"London\",\n    lat: 51.5074,\n    lon: -0.1278,\n    device: \"Chrome-Win\",\n    success: true\n  }\n}];"
+      }
+    },
+    {
+      "id": "InsertEvent",
+      "name": "A) Insert Event",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 1,
+      "position": [ 760, 300 ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO public.login_events\n(user_id, ts, ip, country, region, city, lat, lon, device, success, raw_json)\nVALUES\n({{$json.user_id}}, {{$json.ts}}, {{$json.ip}}, {{$json.country}}, {{$json.region}},\n {{$json.city}}, {{$json.lat}}, {{$json.lon}}, {{$json.device}}, {{$json.success}}, {{$json}}::jsonb)\nRETURNING id;"
+      }
+    },
+    {
+      "id": "RefreshFeatures",
+      "name": "B) Refresh Features",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 1,
+      "position": [ 1060, 300 ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH base AS (\n  SELECT\n    e.id AS event_id,\n    e.user_id,\n    e.ts,\n    EXTRACT(HOUR FROM e.ts)::INT AS hour_of_day,\n    LAG(e.ts)  OVER (PARTITION BY e.user_id ORDER BY e.ts) AS prev_ts,\n    LAG(e.lat) OVER (PARTITION BY e.user_id ORDER BY e.ts) AS prev_lat,\n    LAG(e.lon) OVER (PARTITION BY e.user_id ORDER BY e.ts) AS prev_lon,\n    e.lat, e.lon, e.success\n  FROM public.login_events e\n  LEFT JOIN public.login_features f ON f.event_id = e.id\n  WHERE f.event_id IS NULL\n),\nfeat AS (\n  SELECT\n    event_id,\n    user_id,\n    ts,\n    hour_of_day,\n    CASE WHEN prev_ts IS NULL THEN NULL\n         ELSE EXTRACT(EPOCH FROM (ts - prev_ts))/60.0 END AS minutes_since_prev,\n    public.haversine_km(prev_lat, prev_lon, lat, lon) AS geo_km_from_prev,\n    (\n      SELECT COUNT(*)\n      FROM public.login_events z\n      WHERE z.user_id = base.user_id\n        AND z.success = false\n        AND z.ts > base.ts - INTERVAL '15 minutes'\n        AND z.ts <= base.ts\n    ) AS failed_15m,\n    (hour_of_day BETWEEN 0 AND 5) AS is_night\n  FROM base\n)\nINSERT INTO public.login_features AS lf\n(event_id, user_id, ts, hour_of_day, minutes_since_prev, geo_km_from_prev, failed_15m, is_night)\nSELECT event_id, user_id, ts, hour_of_day, minutes_since_prev, geo_km_from_prev, failed_15m, is_night\nFROM feat\nON CONFLICT (event_id) DO UPDATE\nSET user_id = EXCLUDED.user_id,\n    ts      = EXCLUDED.ts,\n    hour_of_day        = EXCLUDED.hour_of_day,\n    minutes_since_prev = EXCLUDED.minutes_since_prev,\n    geo_km_from_prev   = EXCLUDED.geo_km_from_prev,\n    failed_15m         = EXCLUDED.failed_15m,\n    is_night           = EXCLUDED.is_night;"
+      }
+    },
+    {
+      "id": "SelectToScore",
+      "name": "C) Select To Score",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 1,
+      "position": [ 1360, 300 ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT e.id AS event_id,\n       f.user_id, f.ts, f.hour_of_day, f.minutes_since_prev,\n       f.geo_km_from_prev, f.failed_15m, f.is_night::int AS is_night\nFROM public.login_features f\nJOIN public.login_events e ON e.id = f.event_id\nWHERE f.ts > (SELECT last_run_ts FROM public.meta_run_state ORDER BY id DESC LIMIT 1)\nORDER BY f.ts ASC\nLIMIT 500;"
+      }
+    },
+    {
+      "id": "ScoreBatch",
+      "name": "D) Score Batch (HTTP)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [ 1660, 300 ],
+      "parameters": {
+        "url": "http://127.0.0.1:8001/predict",
+        "responseFormat": "json",
+        "jsonParameters": true,
+        "sendBody": true,
+        "bodyParametersJson": "{\n  \"items\": {{$json}}\n}"
+      }
+    },
+    {
+      "id": "UnwrapResults",
+      "name": "D.1) Unwrap Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [ 1960, 300 ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const res = $json; \nreturn (res.results || []).map(r => ({ json: r }));"
+      }
+    },
+    {
+      "id": "UpsertScores",
+      "name": "E1) Upsert Scores",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 1,
+      "position": [ 2260, 260 ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO public.anomaly_scores (event_id, model_version, score, threshold, predicted)\nVALUES ({{$json.event_id}}, {{$json.model_version}}, {{$json.score}}, {{$json.threshold}}, {{$json.predicted}})\nON CONFLICT (event_id, model_version) DO UPDATE\nSET score = EXCLUDED.score,\n    threshold = EXCLUDED.threshold,\n    predicted = EXCLUDED.predicted;"
+      }
+    },
+    {
+      "id": "CreateAlerts",
+      "name": "E2) Create Alerts",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 1,
+      "position": [ 2260, 340 ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO public.security_alerts\n(event_id, model_version, score, threshold, severity, message, notified)\nSELECT\n  {{$json.event_id}},\n  {{$json.model_version}},\n  {{$json.score}},\n  {{$json.threshold}},\n  CASE\n    WHEN {{$json.score}} >= {{$json.threshold}} * 1.5 THEN 'high'\n    WHEN {{$json.score}} >= {{$json.threshold}} * 1.2 THEN 'medium'\n    ELSE 'low'\n  END,\n  'Suspicious login detected for event ' || {{$json.event_id}},\n  false\nWHERE {{$json.score}} >= {{$json.threshold}}\nRETURNING id;"
+      }
+    },
+    {
+      "id": "AdvanceCursor",
+      "name": "F) Advance Cursor",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 1,
+      "position": [ 2560, 300 ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE public.meta_run_state\nSET last_run_ts = now()\nWHERE id = (SELECT id FROM public.meta_run_state ORDER BY id DESC LIMIT 1);"
+      }
+    }
+  ],
+  "connections": {
+    "When clicking 'Execute workflow'": {
+      "main": [[{ "node": "Build Sample Event", "type": "main", "index": 0 }]]
+    },
+    "Build Sample Event": {
+      "main": [[{ "node": "A) Insert Event", "type": "main", "index": 0 }]]
+    },
+    "A) Insert Event": {
+      "main": [[{ "node": "B) Refresh Features", "type": "main", "index": 0 }]]
+    },
+    "B) Refresh Features": {
+      "main": [[{ "node": "C) Select To Score", "type": "main", "index": 0 }]]
+    },
+    "C) Select To Score": {
+      "main": [[{ "node": "D) Score Batch (HTTP)", "type": "main", "index": 0 }]]
+    },
+    "D) Score Batch (HTTP)": {
+      "main": [[{ "node": "D.1) Unwrap Results", "type": "main", "index": 0 }]]
+    },
+    "D.1) Unwrap Results": {
+      "main": [
+        [{ "node": "E1) Upsert Scores", "type": "main", "index": 0 }],
+        [{ "node": "E2) Create Alerts", "type": "main", "index": 0 }]
+      ]
+    },
+    "E2) Create Alerts": {
+      "main": [[{ "node": "F) Advance Cursor", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "pinData": {},
+  "version": 2
+}

@@ -1,0 +1,15 @@
+#environment varaibles file
+.env
+
+# saved model 
+model.pkl
+
+# virtual environment folder
+automation/
+
+# python bytecode files
+__pycache__/
+
+# other system files
+.idea
+.DS_Store
