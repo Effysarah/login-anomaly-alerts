@@ -2,20 +2,20 @@
 
 This document explains how to run the project end-to-end, from database setup to automated alerts.
 
-## 1) Prerequisites
+##  Prerequisites
 - Python 3.10+
 - Supabase project (Postgres)
 - n8n cloud or self-hosted
 - `uvicorn`, `fastapi`, `scikit-learn`, `joblib`, `psycopg2-binary`
 
-## 2) Environment
+##  Environment
 Create `.env` at the repo root (copy `.env.example`):
 
 ```ini
 DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/postgres?sslmode=require
 API_PORT=8001
-
-Database Setup
+```
+## Database Setup
 
 Use Supabase SQL Editor:
 
@@ -27,14 +27,14 @@ Run sql/schema.sql
 
 Optionally seed a few rows (provided at the bottom of schema.sql/setup.sql)
 
-Verify:
+## Verify:
 
-``sql
+```sql
 SELECT id, user_id, ts, country, city, success
 FROM public.login_events
 ORDER BY id DESC
 LIMIT 5;
-
+```
 ## Train the Model
 ```bash
 cd fastapi_app
@@ -46,11 +46,12 @@ This creates fastapi_app/model.pkl with a default threshold.
 
 
 Run the API
+```bash
 uvicorn fastapi_app.app:app --reload --port 8001
-
+```
 
 Open http://127.0.0.1:8001/docs to test /predict.
-
+```json
 Prediction payload example
 {
   "items": [
@@ -64,18 +65,18 @@ Prediction payload example
     }
   ]
 }
-
-6) n8n Workflow
+```
+## n8n Workflow
 
 You can either import n8n/login_anomaly_workflow.json or build nodes manually.
 
-Node Overview
+**Node Overview**
 
 Set / Build Sample Event
 Output a single item with:
-
+```scss
 user_id, ts (ISO), ip, country, region, city, lat, lon, device, success
-
+```
 
 A) Insert Event (Postgres → Execute Query)
 Use either:
@@ -105,18 +106,20 @@ Insert into security_alerts when score >= threshold.
 F) Advance Cursor (optional)
 Update meta_run_state.
 
-7) Verify
+##  Verify
+```sql
 SELECT *
 FROM public.anomaly_scores
 ORDER BY created_at DESC
 LIMIT 10;
-
+```
+```sql
 SELECT *
 FROM public.security_alerts
 ORDER BY created_at DESC
 LIMIT 10;
-
-8) Troubleshooting
+```
+##  Troubleshooting
 
 “null value in column 'user_id'”
 The Insert node saw an empty/undefined user_id. Ensure the Set node outputs it and your Insert node reads that item.
@@ -133,19 +136,8 @@ Use {{$now}} (ISO string) in Set node; cast to ::timestamptz in SQL.
 Local API not reachable from n8n Cloud
 Use a tunnel (ngrok, Cloudflared) or run n8n locally to access http://127.0.0.1:8001.
 
-9) Notes
+## Notes
 
 model.pkl is git-ignored. Generate locally via train_model.py.
 
 Keep secrets in .env, not in code or workflows.
-
-
----
-
-### TL;DR
-
-- **If the extra files are empty:** delete them.
-- If you want nice separation, keep them and paste the contents I supplied.
-- Put the **step-by-step** in `docs/usage.md` (above), keep the **why** and high level in `README.md`.
-
-You’re in great shape for the interview—push now with the tidy README, the filled `setup.sql` (or split files), and the usage doc.
